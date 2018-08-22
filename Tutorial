@@ -1,0 +1,837 @@
+{
+ "cells": [
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "# Deep-RL in gym using Keras\n",
+    "\n",
+    "   \n",
+    "## Introduction and acknowledgments\n",
+    "This interactive notebook is an introduction on how to use Tensorflow (with the Keras API) to train a model under OpenAI's [gym](https://gym.openai.com/) scenarios. Below, I describe training and test loops that can be applied easily to any of the scenarios within gym. The pre-requisite knowledge is a basic understanding of coding and neural networks, as well as an understanding of Markoff decision processes, Q-learning, and reinforcement-learning (RL). The final algorithm is heavily based off of that described in [Tambet Matiisen's blog post](http://neuro.cs.ut.ee/demystifying-deep-reinforcement-learning/), which contains a pseudo-code outline of the algorithm as well as an excellent review of all pre-requisite knowledge. The batching and memory abstraction that I use is from the work of [Jannes Klaas](https://github.com/JannesKlaas/sometimes_deep_sometimes_learning/blob/master/reinforcement.ipynb), with slight modifications for compatibility.\n",
+    "\n",
+    "\n",
+    "\n",
+    "\n",
+    "\n"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## Dependencies\n",
+    "- Python 3.6 or higher\n",
+    "- NumPy\n",
+    "- Keras\n",
+    "- Tensorflow\n",
+    "- Gym"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## Exploring gym\n",
+    "First, we import the libraries we will use throughout this notebook."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 2,
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "/Users/WilliamWu/miniconda3/envs/gym/lib/python3.6/site-packages/h5py/__init__.py:36: FutureWarning: Conversion of the second argument of issubdtype from `float` to `np.floating` is deprecated. In future, it will be treated as `np.float64 == np.dtype(float).type`.\n",
+      "  from ._conv import register_converters as _register_converters\n",
+      "Using TensorFlow backend.\n"
+     ]
+    }
+   ],
+   "source": [
+    "import gym\n",
+    "\n",
+    "# Modeling import/export\n",
+    "import os.path\n",
+    "import json\n",
+    "from keras.models import model_from_json\n",
+    "from keras.models import load_model\n",
+    "\n",
+    "# Data preprocessing and modeling\n",
+    "import numpy as np\n",
+    "from keras.models import Sequential\n",
+    "from keras.layers.core import Dense\n",
+    "from keras.optimizers import sgd\n",
+    "\n",
+    "\n"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "The example I use for this tutorial is [Cartpole](https://gym.openai.com/envs/CartPole-v1/), a simple game in which our objective is to balance a moving pole on a cart on a one-dimensional track for as long as possible. For the sake of simplicity, we define a \"win\" to be whether the cart can successfully balance the pole for the full 200 timesteps, with a \"loss\" otherwise. To start, let's try running a couple of games of Cartpole, letting the computer decide what to do randomly."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 3,
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "\u001b[33mWARN: gym.spaces.Box autodetected dtype as <class 'numpy.float32'>. Please provide explicit dtype.\u001b[0m\n",
+      "Game 1: Loss after 12 timesteps\n",
+      "Game 2: Loss after 14 timesteps\n",
+      "Game 3: Loss after 13 timesteps\n",
+      "Game 4: Loss after 18 timesteps\n",
+      "Game 5: Loss after 15 timesteps\n"
+     ]
+    }
+   ],
+   "source": [
+    "env = gym.make('CartPole-v0')\n",
+    "\n",
+    "# Playing 5 games of Cartpole\n",
+    "for game in range(5):\n",
+    "    initial_state = env.reset()\n",
+    "    # Each game lasts 200 timesteps\n",
+    "    for t in range(200):\n",
+    "        env.render()\n",
+    "        # Advance the game by a timestep using a random action\n",
+    "        action = env.action_space.sample()\n",
+    "        observation, reward, done, info = env.step(action)\n",
+    "        if done or t == 199:\n",
+    "            # Print the game results, then start the next game\n",
+    "            if t == 199:\n",
+    "                print(\"Game {}: Win\".format(game + 1))\n",
+    "            else:\n",
+    "                print(\"Game {}: Loss after {} timesteps\".format(game + 1, t + 1))\n",
+    "            break\n",
+    "    \n",
+    "env.close()\n",
+    "    "
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "As we can see, each game is rather brief as the random strategy fares quite poorly. In order to learn more about the game so we can start building our model, we'll break down the loop step-by-step. "
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 4,
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "\u001b[33mWARN: gym.spaces.Box autodetected dtype as <class 'numpy.float32'>. Please provide explicit dtype.\u001b[0m\n",
+      "[-0.02555043 -0.01205376  0.03941492 -0.0229813 ]\n"
+     ]
+    }
+   ],
+   "source": [
+    "env = gym.make('CartPole-v0')\n",
+    "initial_state = env.reset()\n",
+    "print(initial_state)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "Here, we have created a new environment instance of Cartpole. As we can see, calling env.reset() returns an initial state represented as a vector of features. If we run the above codeblock multiple times, the output of the last line will be different every time, meaning that the initial state for Cartpole is random (although this is not necessarily the case for all of the scenarios within gym).\n",
+    "\n",
+    "Let's try to advance the game by a timestep. First, we need to learn more about the action space of Cartpole."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 5,
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "Size of the action space: 2\n"
+     ]
+    }
+   ],
+   "source": [
+    "# Finding the amount of different available actions\n",
+    "print(\"Size of the action space: {}\".format(env.action_space.n))"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 6,
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "Action 1: 0\n",
+      "Action 2: 0\n",
+      "Action 3: 0\n",
+      "Action 4: 1\n",
+      "Action 5: 1\n"
+     ]
+    }
+   ],
+   "source": [
+    "# Sampling 5 random actions\n",
+    "for i in range(5):\n",
+    "    print(\"Action {}: {}\".format(i + 1, env.action_space.sample()))"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "As we can see, the action space only consists of two possible actions, which are conveniently encoded as 0 and 1. Try going back to the previous loop in which we ran several games of Cartpole and changing the line `action = env.action_space.sample()`. Can you see which actions do the 0 and 1 encodings represent?"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "Now that we know a bit more about the action space of Cartpole, we can advance the game by calling env.step(action), which returns the following state represented as an array, the reward obtained by our action, a Boolean representing whether the game has reached a terminal state, and a dictionary containing metadata for the game, in that respective order. We ignore the dictionary returned within the array, as this information is primarily for debugging purposes and is not to be used for training. "
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 7,
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "0\n",
+      "[-0.02579151 -0.20771815  0.0389553   0.28187231] 1.0 False\n"
+     ]
+    }
+   ],
+   "source": [
+    "#Sampling a random action from that space\n",
+    "action = env.action_space.sample()\n",
+    "print(action)\n",
+    "observation, reward, done, info = env.step(action)\n",
+    "print(observation, reward, done)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "Now that we know how to find an initial state, advance the state by a timestep, observe the resulting state and the acquired reward, and loop this process until we reach a terminal state, we have all of the information that we need to begin our process our implementing our deep Q-learning algorithm. The algorithm (as described within Matiisen's post) is shown below for your convenience."
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "```\n",
+    "do train-model:\n",
+    "    initialize replay memory D\n",
+    "    initialize action-value function Q with random weights\n",
+    "    observe initial state s\n",
+    "    repeat\n",
+    "        select an action a\n",
+    "            with probability ε select a random action\n",
+    "            otherwise select a = argmaxa’Q(s,a’)\n",
+    "        carry out action a\n",
+    "        observe reward r and new state s’\n",
+    "        store experience <s, a, r, s’> in replay memory D\n",
+    "\n",
+    "        sample random transitions <ss, aa, rr, ss’> from replay memory D\n",
+    "        calculate target for each minibatch transition\n",
+    "            if ss’ is terminal state then tt = rr\n",
+    "            otherwise tt = rr + γmaxa’Q(ss’, aa’)\n",
+    "        train the Q network using (tt - Q(ss, aa))^2 as loss\n",
+    "\n",
+    "        s = s'\n",
+    "    until terminated\n",
+    "```"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## Implementing the algorithm\n",
+    "First, we need to define the replay memory. A sample implementation is provided below. Notice that `get_batch()` not only creates the input matrix at our desired batch size, but also creates the corresponding target vector as well. The values for the target vector are calculated as seen in the above pseudocode."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 8,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "class Replay(object):\n",
+    "    \"\"\"\n",
+    "    This code was taken, with very slight modification, from Jannes Klaas' deep RL example. I have preserved some of his annotations below, and added some of my own.\n",
+    "    link: https://github.com/JannesKlaas/sometimes_deep_sometimes_learning/blob/master/reinforcement.ipynb\n",
+    "    \n",
+    "    For reference, all starred (*) input arguments are hyperparameters to be adjusted.\n",
+    "    \n",
+    "    During gameplay all the experiences < s, a, r, s’ > are stored in a replay memory. \n",
+    "    In training, batches of randomly drawn experiences are used to generate the input and target for backpropagation.\n",
+    "    For this scenario, simple random sampling of experiences will suffice, but certain prioritized sampling strategies\n",
+    "    may prove useful elsewhere.\n",
+    "    \"\"\"\n",
+    "    def __init__(self, env_dim, max_memory=100, discount=.9):\n",
+    "        \"\"\"\n",
+    "        Inputs: \n",
+    "        max_memory*: the maximum number of experiences we want to store\n",
+    "                    (Typically, you want this value to be higher for games that encounter a larger amount of states.)\n",
+    "        discount*: the discount factor for future experience\n",
+    "        env_dim: the (fixed) length of the feature vector\n",
+    "        \n",
+    "        Output:\n",
+    "        A Replay object that stores experiences as a nested array. Each inner array contains the < s, a, r, s’ >\n",
+    "        experiences as its first element, and a boolean value representing whether the game has ended as its second element.\n",
+    "        \n",
+    "        [...\n",
+    "            [experience, game_over]\n",
+    "            [experience, game_over]\n",
+    "        ...]\n",
+    "        \"\"\"\n",
+    "        \n",
+    "        self.max_memory = max_memory\n",
+    "        self.memory = list()\n",
+    "        self.discount = discount\n",
+    "        self.env_dim = env_dim\n",
+    "\n",
+    "    def remember(self, states, game_over):\n",
+    "        \"\"\"\n",
+    "        Saves a transition experience into memory\n",
+    "        \n",
+    "        Inputs:\n",
+    "        [s, a, r, s’]\n",
+    "        s: numpy array of features\n",
+    "        a: int encoding actions\n",
+    "        r: float representing reward\n",
+    "        s’: numpy array of features, same size as s\n",
+    "        \n",
+    "        game_over: boolean\n",
+    "        \"\"\"\n",
+    "        \n",
+    "        #Save a state to memory\n",
+    "        self.memory.append([states, game_over])\n",
+    "        #We don't want to store infinite memories, so if we have too many, we just delete the oldest one\n",
+    "        if len(self.memory) > self.max_memory:\n",
+    "            del self.memory[0]\n",
+    "            \n",
+    "    def get_batch(self, model, max_batch_size=10):\n",
+    "        \"\"\"\n",
+    "        Sample from our memory and preprocess an input, target pair for training. \n",
+    "        The Q-values for the target matrix are calculated according to the equation:\n",
+    "        Q(s, a) = r + gamma * max Q(s’,a’), where Q(s’,a’) is estimated using the model's weights upon the time of the method being called.\n",
+    "        \n",
+    "        Inputs:\n",
+    "        model: a Keras model that takes in a (m x self.env_dim) size matrix, where m is an undetermined row count,\n",
+    "                and outputs a (m x self.action_space.n) matrix\n",
+    "        max_batch_size*: maximum batch size\n",
+    "        \n",
+    "        Outputs:\n",
+    "        inputs: a numpy matrix of size (m x self.env_dim), which contains the feature vectors for each state in the batch.\n",
+    "                m is either max_batch_size or the current length of self.memory, whichever is smaller.\n",
+    "        targets: a numpy matrix of size (m x self.action_space.n), in which each row contains a vector of Q-Values for each action.\n",
+    "                The ith vector of Q-Values is to correspond to the ith feature vector of the batch.\n",
+    "        \n",
+    "        \n",
+    "        \"\"\"\n",
+    "        \n",
+    "        \n",
+    "        \n",
+    "        #Calculate the number of actions that can possibly be taken in the game\n",
+    "        #We found this value to be 2 earlier, but we can retrieve this value from our model once we build it\n",
+    "        num_actions = model.output_shape[-1]\n",
+    "\n",
+    "        #If we have not yet saved enough states to memory, we must lower our batch size\n",
+    "        len_memory = len(self.memory)\n",
+    "        batch_size = min(len_memory, max_batch_size)\n",
+    "        \n",
+    "        #Initializing numpy matrices of proper sizes\n",
+    "        inputs = np.zeros((batch_size, self.env_dim))\n",
+    "        targets = np.zeros((batch_size, num_actions))\n",
+    "        \n",
+    "        #Random sampling of experiences from memory\n",
+    "        for i, idx in enumerate(np.random.randint(0, len_memory,\n",
+    "                                                  size=batch_size)):\n",
+    "            \"\"\"\n",
+    "            Here we load one transition <s, a, r, s’> from memory\n",
+    "            state_t: initial state s\n",
+    "            action_t: action taken a\n",
+    "            reward_t: reward earned r\n",
+    "            state_tp1: the state that followed s’\n",
+    "            \"\"\"\n",
+    "            state_t, action_t, reward_t, state_tp1 = self.memory[idx][0]\n",
+    "            \n",
+    "            #Checking whether the game had ended, as this affects our calculations of the Q-value\n",
+    "            game_over = self.memory[idx][1]\n",
+    "            #Copying the state feature vector over to input matrix at the appropiate row\n",
+    "            inputs[i:i+1] = state_t\n",
+    "            \n",
+    "            # First we fill the target values with the predictions of the model.\n",
+    "            # They will not be affected by training (since the training loss for them is 0)\n",
+    "            targets[i] = model.predict(state_t)[0]\n",
+    "            \n",
+    "            \"\"\"\n",
+    "            If the game ended, the expected reward Q(s,a) should be the final reward r.\n",
+    "            Otherwise the target value is r + gamma * max Q(s’,a’)\n",
+    "            \"\"\"\n",
+    "            #  Here Q_sa is max_a'Q(s', a')\n",
+    "            Q_sa = np.max(model.predict(state_tp1)[0])\n",
+    "            \n",
+    "            #if the game ended, the reward is the final reward\n",
+    "            if game_over:  # if game_over is True\n",
+    "                targets[i, action_t] = reward_t\n",
+    "            else:\n",
+    "                # r + gamma * max Q(s’,a’)\n",
+    "                targets[i, action_t] = reward_t + self.discount * Q_sa\n",
+    "        return inputs, targets\n",
+    "        "
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "Next, we create our training loop. In deep RL, we train our model continually as we feed inputs and collect information from the game. Thus, we sample from our memory and run an iteration of backpropagation at each timestep. The resulting training algorithm looks very similar to the loop we used to run the game itself. As a result, we can actually render the game throughout the training process, which gives us the ability to visually monitor the training process and to adjust hyperparameters appropiately. "
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 9,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "def train(env, replayMemory, model, epochs, epsilon = .9, batch_size = 10,\n",
+    "          set_size = 10, timesteps = 200, output = 1, render = 0):\n",
+    "    \"\"\"\n",
+    "    Run the game and train the model under the specified hyperparameters. During each frame, we take an\n",
+    "    action according to the epsilon-greedy strategy. Rather than render the game at every step, we can\n",
+    "    choose to render the game periodically to improve the runtime of the algorithm. We deem the collection of\n",
+    "    games that occur in between renders a \"set\", and the size of a set can be adjusted as an argument of this\n",
+    "    function. By default, the function will output the progress of the training after each set,\n",
+    "    through the average training loss per frame and the win count over the last set of games (which may \n",
+    "    not be indicative of the model's overall performance due to our epsilon-greedy policy). \n",
+    "    \n",
+    "    Inputs:\n",
+    "    env: a gym environment used and rendered for training\n",
+    "    replayMemory: an initialized Memory object for storing experiences and generating training batches\n",
+    "    model: a Keras model with valid input and output sizes according to env\n",
+    "    epochs*: amount of games to play in the training cycle\n",
+    "    epsilon*: probability of exploration (vs. exploitation)\n",
+    "    batch_size*: size of batches used for training\n",
+    "    timesteps: length of each game\n",
+    "    set_size: amount of epochs in between rendered games\n",
+    "    output: enable/disable print output\n",
+    "    render: enable/disable rendering\n",
+    "    \n",
+    "    \"\"\"\n",
+    "    \n",
+    "    \n",
+    "    # history arrays, useful for generating time series data\n",
+    "    set_hist = []\n",
+    "    win_hist = []\n",
+    "    \n",
+    "    # counters for tracking progress\n",
+    "    win_cnt = 0\n",
+    "    loss_over_set = 0.\n",
+    "    frames_over_set = 0\n",
+    "    \n",
+    "    # epochs := amount of games to run\n",
+    "    for i_episode in range(epochs):\n",
+    "        \n",
+    "        observation = env.reset()\n",
+    "        loss = 0.\n",
+    "        for t in range(timesteps):\n",
+    "            \n",
+    "            if i_episode % set_size == set_size - 1 and render == 1:\n",
+    "                env.render()\n",
+    "                \n",
+    "            # create a numpy array of the feature vector of the current state\n",
+    "            state_0 = np.array(observation, ndmin=2)\n",
+    "            \n",
+    "            # epsilon-greedy policy\n",
+    "            if np.random.rand() < epsilon:\n",
+    "                action = env.action_space.sample()\n",
+    "            else:\n",
+    "                action = np.argmax(model.predict(state_0)[0])\n",
+    "            \n",
+    "            # take a step and observe our reward and resulting state, while checking whether the game ended\n",
+    "            observation, reward, done, info = env.step(action)\n",
+    "            \n",
+    "            # create a numpy array of the feature vector of the resulting state\n",
+    "            state_1 = np.array(observation, ndmin=2)\n",
+    "            \n",
+    "            # store our experience, < s, a, r, s’ >\n",
+    "            replayMemory.remember([state_0, action, reward, state_1], done)\n",
+    "            \n",
+    "            # sample from our memory and create input and target matrices for training\n",
+    "            inputs, targets = replayMemory.get_batch(model, max_batch_size=batch_size)\n",
+    "            \n",
+    "            # train our model and record data\n",
+    "            batch_loss = model.train_on_batch(inputs, targets)\n",
+    "            loss += batch_loss\n",
+    "            \n",
+    "            frames_over_set += 1\n",
+    "            loss_over_set += batch_loss\n",
+    "            \n",
+    "            # if the game has ended, record data before moving on to the next game\n",
+    "            if done or t + 1 == timesteps:\n",
+    "                # note that a \"win\" here means reaching the last timestep\n",
+    "                if t + 1 == timesteps:\n",
+    "                    win_cnt += 1\n",
+    "                    win_hist.append(1)\n",
+    "                else:\n",
+    "                    win_hist.append(0)\n",
+    "                \n",
+    "                break\n",
+    "                \n",
+    "        # after each set, report progress and reset the counters\n",
+    "        if i_episode % set_size == set_size - 1:\n",
+    "            if output > 0:\n",
+    "                print(\"Episode finished after {} timesteps\".format(t+1))\n",
+    "                print(\"Epoch {:03d}/{:03d} | Average Loss per frame over set: {:.4f} | Win count over past set: {}\"\n",
+    "                      .format(i_episode + 1, epochs, loss_over_set / frames_over_set, win_cnt))\n",
+    "            \n",
+    "            win_cnt = 0\n",
+    "            loss_over_set = 0.\n",
+    "            frames_over_set = 0\n",
+    "            \n",
+    "            set_hist.append(win_hist)\n",
+    "            win_hist = []\n",
+    "                \n",
+    "            \n",
+    "        \n",
+    "    env.reset()\n",
+    "    env.close()"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## Training\n",
+    "With our training function fully set up, we can begin to define hyperparameters and build our model. For this task, 3 simple dense layers will suffice."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 41,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "\"\"\"\n",
+    "Hyperparameters\n",
+    "\"\"\"\n",
+    "epsilon = .10  # probability of choosing a random action instead of using the model to decide\n",
+    "max_memory = 200 # max number of experiences to be stored at once\n",
+    "hidden_size = 100 # size of the hidden layers within the network\n",
+    "batch_size = 20 # amount of experiences to sample into each batch for training\n",
+    "discount = .95 # value of future reward vs. current reward\n",
+    "learning_rate = .005 # the multiplicative rate at which the weights of the model are shifted\n",
+    "timesteps = 200 # length of each game (for Cartpole, ideally set this to between 100-200)\n",
+    "epochs = 300 # (Amount of games played)\n",
+    "set_size = 10 # rate at which games are rendered and progress is reported"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 42,
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "\u001b[33mWARN: gym.spaces.Box autodetected dtype as <class 'numpy.float32'>. Please provide explicit dtype.\u001b[0m\n"
+     ]
+    }
+   ],
+   "source": [
+    "env = gym.make('CartPole-v0')\n",
+    "feature_dims = len(env.reset())\n",
+    "num_actions = env.action_space.n\n",
+    "memory = Replay(max_memory = max_memory, discount = discount, env_dim = feature_dims)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 45,
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "_________________________________________________________________\n",
+      "Layer (type)                 Output Shape              Param #   \n",
+      "=================================================================\n",
+      "dense_19 (Dense)             (None, 100)               500       \n",
+      "_________________________________________________________________\n",
+      "dense_20 (Dense)             (None, 100)               10100     \n",
+      "_________________________________________________________________\n",
+      "dense_21 (Dense)             (None, 2)                 202       \n",
+      "=================================================================\n",
+      "Total params: 10,802\n",
+      "Trainable params: 10,802\n",
+      "Non-trainable params: 0\n",
+      "_________________________________________________________________\n"
+     ]
+    }
+   ],
+   "source": [
+    "model = Sequential()\n",
+    "model.add(Dense(hidden_size, input_shape=(feature_dims,), activation='relu'))\n",
+    "model.add(Dense(hidden_size, activation='relu'))\n",
+    "model.add(Dense(num_actions))\n",
+    "model.compile(sgd(lr=learning_rate), \"mse\")\n",
+    "model.summary()"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "With everything all set, we can finally train our model. With around 800 epochs, it takes around an hour to fully train the model with a CPU."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 46,
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "Episode finished after 9 timesteps\n",
+      "Epoch 010/300 | Average Loss per frame over set: 0.7186 | Win count over past set: 0\n",
+      "Episode finished after 11 timesteps\n",
+      "Epoch 020/300 | Average Loss per frame over set: 2.3550 | Win count over past set: 0\n",
+      "Episode finished after 8 timesteps\n",
+      "Epoch 030/300 | Average Loss per frame over set: 2.2142 | Win count over past set: 0\n",
+      "Episode finished after 9 timesteps\n",
+      "Epoch 040/300 | Average Loss per frame over set: 0.7991 | Win count over past set: 0\n",
+      "Episode finished after 10 timesteps\n",
+      "Epoch 050/300 | Average Loss per frame over set: 0.8686 | Win count over past set: 0\n",
+      "Episode finished after 10 timesteps\n",
+      "Epoch 060/300 | Average Loss per frame over set: 0.7768 | Win count over past set: 0\n",
+      "Episode finished after 14 timesteps\n",
+      "Epoch 070/300 | Average Loss per frame over set: 1.0704 | Win count over past set: 0\n",
+      "Episode finished after 15 timesteps\n",
+      "Epoch 080/300 | Average Loss per frame over set: 1.3015 | Win count over past set: 0\n",
+      "Episode finished after 12 timesteps\n",
+      "Epoch 090/300 | Average Loss per frame over set: 1.3413 | Win count over past set: 0\n",
+      "Episode finished after 23 timesteps\n",
+      "Epoch 100/300 | Average Loss per frame over set: 1.6807 | Win count over past set: 0\n",
+      "Episode finished after 21 timesteps\n",
+      "Epoch 110/300 | Average Loss per frame over set: 1.6271 | Win count over past set: 0\n",
+      "Episode finished after 18 timesteps\n",
+      "Epoch 120/300 | Average Loss per frame over set: 2.2409 | Win count over past set: 0\n",
+      "Episode finished after 27 timesteps\n",
+      "Epoch 130/300 | Average Loss per frame over set: 2.8306 | Win count over past set: 0\n",
+      "Episode finished after 44 timesteps\n",
+      "Epoch 140/300 | Average Loss per frame over set: 0.9667 | Win count over past set: 0\n",
+      "Episode finished after 51 timesteps\n",
+      "Epoch 150/300 | Average Loss per frame over set: 0.3511 | Win count over past set: 1\n",
+      "Episode finished after 133 timesteps\n",
+      "Epoch 160/300 | Average Loss per frame over set: 1.3450 | Win count over past set: 0\n",
+      "Episode finished after 138 timesteps\n",
+      "Epoch 170/300 | Average Loss per frame over set: 0.3406 | Win count over past set: 2\n",
+      "Episode finished after 182 timesteps\n",
+      "Epoch 180/300 | Average Loss per frame over set: 0.4602 | Win count over past set: 6\n",
+      "Episode finished after 200 timesteps\n",
+      "Epoch 190/300 | Average Loss per frame over set: 0.8390 | Win count over past set: 8\n",
+      "Episode finished after 200 timesteps\n",
+      "Epoch 200/300 | Average Loss per frame over set: 0.7010 | Win count over past set: 8\n",
+      "Episode finished after 26 timesteps\n",
+      "Epoch 210/300 | Average Loss per frame over set: 0.5991 | Win count over past set: 7\n",
+      "Episode finished after 200 timesteps\n",
+      "Epoch 220/300 | Average Loss per frame over set: 1.0303 | Win count over past set: 5\n",
+      "Episode finished after 198 timesteps\n",
+      "Epoch 230/300 | Average Loss per frame over set: 0.6388 | Win count over past set: 6\n",
+      "Episode finished after 200 timesteps\n",
+      "Epoch 240/300 | Average Loss per frame over set: 0.2840 | Win count over past set: 5\n",
+      "Episode finished after 13 timesteps\n",
+      "Epoch 250/300 | Average Loss per frame over set: 0.2489 | Win count over past set: 1\n",
+      "Episode finished after 200 timesteps\n",
+      "Epoch 260/300 | Average Loss per frame over set: 1.3121 | Win count over past set: 2\n",
+      "Episode finished after 200 timesteps\n",
+      "Epoch 270/300 | Average Loss per frame over set: 0.3920 | Win count over past set: 4\n",
+      "Episode finished after 106 timesteps\n",
+      "Epoch 280/300 | Average Loss per frame over set: 0.2042 | Win count over past set: 4\n",
+      "Episode finished after 200 timesteps\n",
+      "Epoch 290/300 | Average Loss per frame over set: 0.2862 | Win count over past set: 2\n",
+      "Episode finished after 154 timesteps\n",
+      "Epoch 300/300 | Average Loss per frame over set: 0.1581 | Win count over past set: 6\n"
+     ]
+    }
+   ],
+   "source": [
+    "train(env = env, replayMemory = memory, model = model, epochs = epochs, epsilon = epsilon, batch_size = batch_size,\n",
+    "      set_size = set_size, timesteps = timesteps, output = 1, render = 0)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## Testing\n",
+    "\n",
+    "Next, we define a testing function to test the performance of our model. The body of the function looks much like the loop where we ran Cartpole earlier, expect we use our model to decide our actions rather than `env.action_space.sample()`."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 16,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "def test(model, games = 100, timesteps = 200, output = 1, render = 0):\n",
+    "    \"\"\"\n",
+    "    Test our model and output results.\n",
+    "    \n",
+    "    Inputs:\n",
+    "    model: model to be tested\n",
+    "    games: amount of games to play\n",
+    "    timesteps: length of each game\n",
+    "    output: enable/disable print output\n",
+    "    render: enable/disable rendering \n",
+    "    \"\"\"\n",
+    "    \n",
+    "    Win_count = 0\n",
+    "    \n",
+    "    env = gym.make('CartPole-v0')\n",
+    "    for game in range(games):\n",
+    "        observation = env.reset()\n",
+    "        total_reward = 0\n",
+    "        for t in range(timesteps):\n",
+    "            if render == 1:\n",
+    "                env.render()\n",
+    "            state = np.array(observation, ndmin=2)\n",
+    "            action = np.argmax(model.predict(state)[0])\n",
+    "            observation, reward, done, info = env.step(action)\n",
+    "            total_reward += reward\n",
+    "            if done or t >= timesteps - 1:\n",
+    "                if t >= timesteps - 1:\n",
+    "                    Win_count += 1\n",
+    "                break\n",
+    "    if output == 1:\n",
+    "        print(\"Test results: {}/{} games won.\".format(Win_count, games))\n",
+    "    env.close()\n",
+    "    "
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 50,
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "\u001b[33mWARN: gym.spaces.Box autodetected dtype as <class 'numpy.float32'>. Please provide explicit dtype.\u001b[0m\n",
+      "Test results: 10/10 games won.\n"
+     ]
+    }
+   ],
+   "source": [
+    "test(model, games = 10, render = 1, output= 1, timesteps = timesteps)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "With some tweaks to the hyperparameters, you should be able to reliably train a model that wins nearly every game. Typically, with a lower epsilon, it will take more epochs to train the model fully, but the success of the model will become more reliable. Because of the way that the training loop is structured, it is actually possible to further train the model after the initial epochs. If you find the model failing to win the game, try training the model under 50-100 additional games and rerunning the testing function."
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## Saving the model\n",
+    "Once you've trained a successful model, Keras will allow you to easily save your model (both its structure and weights) with h5py. "
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 51,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# Saving the model to your current working directory\n",
+    "pwd = os.path.abspath(\".\")\n",
+    "filename = \"model\"\n",
+    "model.save(os.path.join(pwd, filename + \".h5\"))"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## Final thoughts and appendix\n",
+    "\n",
+    "Congratulations on building your first model for Cartpole! The code presented in this tutorial should be versatile enough to translate into a vast majority of the gym scenarios. When applying this design to other scenarios, modifications must be made to the win-tracking section of the training and test functions (and perhaps moving to a reward-based rather than win-based analysis of performance). For Cartpole, it isn't very difficult to train a model that can win 100% of the time, but, as you can see from the training output, the training isn't always reliable. Can you come up with model designs (or hyperparameters) that are able to train a winning model more reliably? Below are some questions for thought.\n",
+    "\n",
+    "* Notice that when we build our deep RL model, we didn't have to actually find out what the values of the feature vector actually mean in terms of the game's state. Read the design of Cartpole [here](https://github.com/openai/gym/blob/master/gym/envs/classic_control/cartpole.py). What parts of the game are described by the feature vector? Recall that our original goal was to design a model that could consistently balance the pole for 200 timesteps. Knowing that, what variables can we add to our feature vector that could improve our ability to model the scenario?\n",
+    "\n",
+    "* You might have noticed that, in Cartpole, the reward assigned is exactly 1.0 in every timestep, as long as the pole doesn't tip over. Thus, what goal is our model (and learning algorithm) attempting to achieve? What changes can we make to our reward assignment to better achieve our actual goal? Will those changes in reward assignment require additional information from the feature vector?\n",
+    "\n"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "### Further work\n",
+    "You can check out some extensions I made for this project in [appendix.py](./appendix.py)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": []
+  }
+ ],
+ "metadata": {
+  "kernelspec": {
+   "display_name": "Python 3",
+   "language": "python",
+   "name": "python3"
+  },
+  "language_info": {
+   "codemirror_mode": {
+    "name": "ipython",
+    "version": 3
+   },
+   "file_extension": ".py",
+   "mimetype": "text/x-python",
+   "name": "python",
+   "nbconvert_exporter": "python",
+   "pygments_lexer": "ipython3",
+   "version": "3.6.5"
+  }
+ },
+ "nbformat": 4,
+ "nbformat_minor": 2
+}
